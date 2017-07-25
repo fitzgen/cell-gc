@@ -391,3 +391,195 @@ pub fn compile_expr<'h>(hs: &mut GcHeapSession<'h>, expr: Value<'h>) -> Result<E
         _ => Err("not an expression".into()),
     }
 }
+
+
+// Compiling to CPS ////////////////////////////////////////////////////////////
+
+fn lambda<'h>(
+    hs: &mut GcHeapSession<'h>,
+    k: GcLeaf<InternedString>,
+    body: Expr<'h>
+) -> Expr<'h> {
+    Expr::Fun(hs.alloc(Code {
+        params: hs.alloc(vec![k]),
+        rest: false,
+        body
+    }))
+}
+
+fn call<'h>(
+    hs: &mut GcHeapSession<'h>,
+    f: Expr<'h>,
+    arg: Expr<'h>
+) -> Expr<'h> {
+    Expr::App(hs.alloc(vec![f, arg]))
+}
+
+fn call_continuation<'h>(
+    hs: &mut GcHeapSession<'h>,
+    k: GcLeaf<InternedString>,
+    arg: Expr<'h>
+) -> Expr<'h> {
+    call(hs, Expr::Var(k), arg)
+}
+
+/// TODO FITZGEN
+pub fn cps<'h>(
+    hs: &mut GcHeapSession<'h>,
+    expr: Expr<'h>
+) -> Expr<'h> {
+    match expr {
+        Expr::Var(var) => cps_var(hs, var),
+        Expr::Con(quoted) => cps_quote(hs, quoted),
+        Expr::Set(set) => cps_set(hs, set),
+        Expr::Def(def) => cps_def(hs, def),
+        Expr::If(ifref) => cps_if(hs, ifref),
+        Expr::Seq(exprs) => cps_seq(hs, exprs.get_all()),
+        Expr::Fun(fun) => cps_fun(hs, fun),
+        Expr::App(call) => cps_app(hs, call),
+        Expr::Letrec(letrec) => cps_letrec(hs, letrec),
+    }
+}
+
+fn cps_var<'h>(hs: &mut GcHeapSession<'h>, var: GcLeaf<InternedString>) -> Expr<'h> {
+    let k = GcLeaf::new(InternedString::gensym());
+    lambda(
+        hs,
+        k.clone(),
+        call_continuation(hs, k, Expr::Var(var))
+    )
+}
+
+fn cps_quote<'h>(hs: &mut GcHeapSession<'h>, quoted: Value<'h>) -> Expr<'h> {
+    let k = GcLeaf::new(InternedString::gensym());
+    lambda(hs, k.clone(), call_continuation(hs, k, Expr::Con(quoted)))
+}
+
+fn cps_set<'h>(hs: &mut GcHeapSession<'h>, set: DefRef<'h>) -> Expr<'h> {
+    let k = GcLeaf::new(InternedString::gensym());
+    let value = GcLeaf::new(InternedString::gensym());
+    lambda(
+        hs,
+        k.clone(),
+        call(
+            hs,
+            cps(hs, set.value()),
+            lambda(
+                hs,
+                value.clone(),
+                call_continuation(
+                    hs,
+                    k,
+                    Expr::Set(hs.alloc(Def {
+                        name: set.name(),
+                        value: Expr::Var(value)
+                    }))
+                )
+            )
+        )
+    )
+}
+
+fn cps_def<'h>(hs: &mut GcHeapSession<'h>, def: DefRef<'h>) -> Expr<'h> {
+    unimplemented!()
+}
+
+fn cps_if<'h>(hs: &mut GcHeapSession<'h>, ifref: IfRef<'h>) -> Expr<'h> {
+    let k = GcLeaf::new(InternedString::gensym());
+    let condition = GcLeaf::new(InternedString::gensym());
+    let consequent = GcLeaf::new(InternedString::gensym());
+    let alternative = GcLeaf::new(InternedString::gensym());
+    lambda(
+        hs,
+        k.clone(),
+        call(
+            hs,
+            cps(hs, ifref.cond()),
+            lambda(
+                hs,
+                condition.clone(),
+                Expr::If(hs.alloc(If {
+                    cond: Expr::Var(condition),
+                    t_expr: call(
+                        hs,
+                        cps(hs, ifref.t_expr()),
+                        lambda(
+                            hs,
+                            consequent.clone(),
+                            call_continuation(hs, k, Expr::Var(consequent))
+                        )
+                    ),
+                    f_expr: call(
+                        hs,
+                        cps(hs, ifref.t_expr()),
+                        lambda(
+                            hs,
+                            alternative.clone(),
+                            call_continuation(hs, k, Expr::Var(alternative))
+                        )
+                    ),
+                }))
+            )
+        )
+    )
+}
+
+fn cps_seq<'h>(hs: &mut GcHeapSession<'h>, exprs: Vec<Expr<'h>>) -> Expr<'h> {
+    exprs.into_iter()
+        .rev()
+        .fold(cps(hs, Expr::Con(Nil)), |cont, expr| {
+            let k = GcLeaf::new(InternedString::gensym());
+            let void = GcLeaf::new(InternedString::gensym());
+            let a = GcLeaf::new(InternedString::gensym());
+            let b = GcLeaf::new(InternedString::gensym());
+            lambda(
+                hs,
+                k.clone(),
+                call(
+                    hs,
+                    cont,
+                    lambda(
+                        hs,
+                        b.clone(),
+                        call(
+                            hs,
+                            cps(hs, expr),
+                            lambda(
+                                hs,
+                                a.clone(),
+                                call_continuation(
+                                    hs,
+                                    k,
+                                    call(
+                                        hs,
+                                        call(
+                                            hs,
+                                            lambda(
+                                                hs,
+                                                void,
+                                                Expr::Var(b)
+                                            ),
+                                            Expr::Var(a)
+                                        ),
+                                        Expr::Con(Nil)
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        })
+}
+
+fn cps_fun<'h>(hs: &mut GcHeapSession<'h>, code: CodeRef<'h>) -> Expr<'h> {
+    unimplemented!()
+}
+
+fn cps_app<'h>(hs: &mut GcHeapSession<'h>, call: VecRef<'h, Expr<'h>>) -> Expr<'h> {
+    unimplemented!()
+}
+
+fn cps_letrec<'h>(hs: &mut GcHeapSession<'h>, letrec: LetrecRef<'h>) -> Expr<'h> {
+    unimplemented!()
+}
