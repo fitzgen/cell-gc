@@ -460,13 +460,19 @@ impl<U> TypedPage<U> {
     }
 
     /// Sweep this page and return the number of objects swept.
-    unsafe fn sweep(&mut self) -> usize {
+    unsafe fn sweep(&mut self) -> SweepResult {
         let mut num_swept = 0;
+        let mut is_full = true;
+        let mut is_empty = true;
 
         let mut addr = self.begin();
         let end = self.end();
         while addr < end {
             let mw = &mut *(addr as *mut MarkWord);
+
+            is_full &= mw.is_allocated() && mw.is_marked();
+            is_empty &= !(mw.is_allocated() && mw.is_marked());
+
             if mw.is_allocated() && !mw.is_marked() {
                 let object_ptr = (addr + mem::size_of::<MarkWord>()) as *mut U;
                 ptr::drop_in_place(object_ptr);
@@ -482,8 +488,30 @@ impl<U> TypedPage<U> {
             addr += Self::allocation_size();
         }
 
-        num_swept
+        if is_full {
+            debug_assert_eq!(num_swept, 0);
+            SweepResult::Full
+        } else if is_empty {
+            SweepResult::Empty(num_swept)
+        } else {
+            SweepResult::Partial(num_swept)
+        }
     }
+}
+
+/// Results of sweeping a page: the page's status and number of objects
+/// reclaimed.
+pub(crate) enum SweepResult {
+    /// The page is (still) full. It is therefore trivially true that we didn't
+    /// reclaim any objects.
+    Full,
+
+    /// The page is now empty, and we reclaimed the given number of objects.
+    Empty(u16),
+
+    /// The page is partially full, and we reclaimed the given number of
+    /// objects.
+    Partial(u16),
 }
 
 /// Sweep a page and return the number of objects swept.
@@ -492,7 +520,7 @@ impl<U> TypedPage<U> {
 ///
 /// This must be called only after a full mark phase, to avoid sweeping objects
 /// that are still reachable.
-unsafe fn sweep_entry_point<'h, T: IntoHeapAllocation<'h>>(header: &mut PageHeader) -> usize {
+unsafe fn sweep_entry_point<'h, T: IntoHeapAllocation<'h>>(header: &mut PageHeader) -> SweepResult {
     header.downcast_mut::<T>().expect("page header corrupted").sweep()
 }
 
@@ -502,7 +530,7 @@ unsafe fn sweep_entry_point<'h, T: IntoHeapAllocation<'h>>(header: &mut PageHead
 pub struct PageSet {
     heap: *mut GcHeap,
 
-    sweep_fn: unsafe fn(&mut PageHeader) -> usize,
+    sweep_fn: unsafe fn(&mut PageHeader) -> SweepResult,
 
     /// Total number of pages in the following lists.
     page_count: usize,
@@ -510,8 +538,11 @@ pub struct PageSet {
     /// Head of the linked list of fully allocated pages.
     full_pages: *mut PageHeader,
 
-    /// Head of the linkedlist of nonfull pages.
-    other_pages: *mut PageHeader,
+    /// Head of the linked list of empty pages.
+    empty_pages: *mut PageHeader,
+
+    /// Head of the linkedlist of partially full pages.
+    partial_pages: *mut PageHeader,
 
     /// The maximum number of pages, or None for no limit.
     limit: Option<usize>,
@@ -544,7 +575,7 @@ fn each_page_mut<F: FnMut(&mut PageHeader)>(first_page: *mut PageHeader, mut f: 
 impl Drop for PageSet {
     fn drop(&mut self) {
         // Don't use each_page here: we're dropping them.
-        for page_list in &[self.full_pages, self.other_pages] {
+        for page_list in &[self.full_pages, self.partial_pages, self.empty_pages] {
             let mut page = *page_list;
             while !page.is_null() {
                 unsafe {
@@ -573,7 +604,8 @@ impl PageSet {
             sweep_fn: sweep_entry_point::<T>,
             page_count: 0,
             full_pages: ptr::null_mut(),
-            other_pages: ptr::null_mut(),
+            empty_pages: ptr::null_mut(),
+            partial_pages: ptr::null_mut(),
             limit: None,
         }
     }
@@ -601,12 +633,14 @@ impl PageSet {
 
     fn each_page<F: FnMut(&PageHeader)>(&self, mut f: F) {
         each_page(self.full_pages, &mut f);
-        each_page(self.other_pages, &mut f);
+        each_page(self.partial_pages, &mut f);
+        each_page(self.empty_pages, &mut f);
     }
 
     fn each_page_mut<F: FnMut(&mut PageHeader)>(&mut self, mut f: F) {
         each_page_mut(self.full_pages, &mut f);
-        each_page_mut(self.other_pages, &mut f);
+        each_page_mut(self.partial_pages, &mut f);
+        each_page_mut(self.empty_pages, &mut f);
     }
 
     /// Clear mark bits from each page in this set.
@@ -627,34 +661,38 @@ impl PageSet {
     pub unsafe fn sweep(&mut self) -> usize {
         let mut num_swept = 0;
 
-        // Sweep nonfull pages.
-        each_page_mut(self.other_pages, |page| {
-            num_swept += (self.sweep_fn)(page);
-        });
+        let mut new_full_pages = ptr::null_mut();
+        let mut new_partial_pages = ptr::null_mut();
+        // Because we don't need to sweep empty pages, we won't modify their
+        // list while iterating over them, and don't need a new head element for
+        // them.
 
-        // Sweep full pages. Much more complicated because we have to move
-        // pages from one list to the other if any space is freed.
-        let mut prev_page = &mut self.full_pages;
-        let mut page = *prev_page;
-        while !page.is_null() {
-            let num_swept_this_page = (self.sweep_fn)(&mut *page);
-            num_swept += num_swept_this_page;
-            if num_swept_this_page > 0 {
+        for &page_header in &[self.full_pages, self.partial_pages] {
+            let mut page = page_header;
+            while !page.is_null() {
                 let next_page = (*page).next_page;
-
-                // remove from full list
-                *prev_page = next_page;
-
-                // add to nonfull list
-                (*page).next_page = self.other_pages;
-                self.other_pages = page;
-
+                match (self.sweep_fn)(&mut *page) {
+                    SweepResult::Empty(swept_this_page) => {
+                        num_swept += swept_this_page as usize;
+                        (*page).next_page = self.empty_pages;
+                        self.empty_pages = page;
+                    }
+                    SweepResult::Partial(swept_this_page) => {
+                        num_swept += swept_this_page as usize;
+                        (*page).next_page = new_partial_pages;
+                        new_partial_pages = page;
+                    }
+                    SweepResult::Full => {
+                        (*page).next_page = new_full_pages;
+                        new_full_pages = page;
+                    }
+                }
                 page = next_page;
-            } else {
-                prev_page = &mut (*page).next_page;
-                page = *prev_page;
             }
         }
+
+        self.full_pages = new_full_pages;
+        self.partial_pages = new_partial_pages;
 
         num_swept
     }
@@ -689,30 +727,54 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> DerefMut for PageSetRef<'a, 'h, T> 
 
 impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
     pub unsafe fn try_fast_alloc(&mut self) -> Option<UninitializedAllocation<T::In>> {
-        if self.other_pages.is_null() {
-            None
+        if !self.partial_pages.is_null() {
+            Some(self.infallible_fast_alloc_from_partial())
+        } else if !self.empty_pages.is_null() {
+            Some(self.infallible_fast_alloc_from_empty())
         } else {
-            Some(self.infallible_fast_alloc())
+            None
         }
     }
 
-    unsafe fn infallible_fast_alloc(&mut self) -> UninitializedAllocation<T::In> {
+    unsafe fn infallible_fast_alloc_from_partial(&mut self) -> UninitializedAllocation<T::In> {
         // We have a nonfull page. Allocation can't fail.
-        debug_assert!(!self.other_pages.is_null());
+        debug_assert!(!self.partial_pages.is_null());
 
-        let front_page = self.other_pages;
+        let front_page = self.partial_pages;
         let page = (*front_page).unchecked_downcast_mut::<T>();
         let ptr = page.infallible_alloc();
 
         // If the page is full now, move it to the other list.
         if page.freelist.is_null() {
             // Pop this page from the nonfull page list.
-            self.other_pages = page.next_page;
+            self.partial_pages = page.next_page;
 
             // Add it to the full-page list.
             page.next_page = self.full_pages;
             self.full_pages = &mut page.header;
         }
+        ptr
+    }
+
+    unsafe fn infallible_fast_alloc_from_empty(&mut self) -> UninitializedAllocation<T::In> {
+        // We have an empty page. Allocation can't fail.
+        debug_assert!(!self.empty_pages.is_null());
+
+        let front_page = self.empty_pages;
+        let page = (*front_page).unchecked_downcast_mut::<T>();
+        let ptr = page.infallible_alloc();
+
+        // This page is no longer empty. Determine if it belongs with the full
+        // pages or partially full pages.
+        self.empty_pages = page.next_page;
+        if page.freelist.is_null() {
+            page.next_page = self.full_pages;
+            self.full_pages = &mut page.header;
+        } else {
+            page.next_page = self.partial_pages;
+            self.partial_pages = &mut page.header;
+        }
+
         ptr
     }
 
@@ -722,9 +784,15 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
     ///
     /// Safe to call as long as GC is not happening.
     pub unsafe fn try_alloc(&mut self) -> Option<UninitializedAllocation<T::In>> {
-        // First, try to allocate from an existing page.
-        if !self.other_pages.is_null() {
-            return Some(self.infallible_fast_alloc());
+        // First, try to allocate from an existing, partially full page.
+        if !self.partial_pages.is_null() {
+            return Some(self.infallible_fast_alloc_from_partial());
+        }
+
+        // Second, try to allocate from an existing empty page. By preferring to
+        // allocate from partially full pages, we cut down on fragmentation.
+        if !self.empty_pages.is_null() {
+            return Some(self.infallible_fast_alloc_from_empty());
         }
 
         // If there is a limit and we already have at least that many pages, fail.
@@ -776,7 +844,7 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
                 if capacity == 1 {
                     &mut self.page_set.full_pages
                 } else {
-                    &mut self.page_set.other_pages
+                    &mut self.page_set.partial_pages
                 };
 
             ptr::write(
