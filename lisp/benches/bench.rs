@@ -41,3 +41,4 @@ bench!(allocate_all_garbage);
 
 // This takes too long for a #[bench]
 // bench!(nboyer);
+// bench!(earley);

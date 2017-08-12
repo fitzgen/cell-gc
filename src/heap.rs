@@ -328,6 +328,16 @@ impl GcHeap {
         self.gc_counter = cmp::max(self.alloc_counter / 2, MIN_ALLOCS_BEFORE_GC);
     }
 
+    /// Force sweeping of all pages, even empty pages waiting for an incremental
+    /// sweep.
+    fn force_sweep(&mut self) {
+        for page_set in self.page_sets.values_mut() {
+            unsafe {
+                page_set.force_sweep();
+            }
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.page_sets
             .values()
@@ -398,7 +408,7 @@ impl<'h> GcHeapSession<'h> {
             self.heap.gc();
         }
         unsafe {
-            let allocation = match self.get_page_set::<T>().try_alloc() {
+            let (num_incrementally_swept, allocation) = match self.get_page_set::<T>().try_alloc() {
                 Some(p) => p,
                 None => {
                     self.heap.gc();
@@ -409,7 +419,9 @@ impl<'h> GcHeapSession<'h> {
                 }
             };
 
+            self.heap.alloc_counter -= num_incrementally_swept as usize;
             self.heap.alloc_counter += 1;
+
             let u = value.into_heap();
             let p = allocation.init(u);
             let gc_ref = T::wrap_gc_ref(GcRef::new(p));
@@ -428,9 +440,10 @@ impl<'h> GcHeapSession<'h> {
             .expect("out of memory (gc did not collect anything)")
     }
 
-    /// Do garbage collection.
+    /// Do garbage collection without any incremental sweeping.
     pub fn force_gc(&mut self) {
         self.heap.gc();
+        self.heap.force_sweep();
     }
 
     /// Freeze a reference to a GC thing so that it can outlive the current GC

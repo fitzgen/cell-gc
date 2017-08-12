@@ -4,7 +4,7 @@
 use heap::{GcHeap, HeapSessionId};
 use marking::MarkingTracer;
 use ptr::{Pointer, UntypedPointer};
-use std::{cmp, hash, mem, ptr};
+use std::{cmp, fmt, hash, mem, ptr};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use traits::{IntoHeapAllocation, Tracer};
@@ -52,6 +52,8 @@ pub unsafe fn get_mark_bit<U>(p: Pointer<U>) -> bool {
 
 pub unsafe fn set_mark_bit<U>(p: Pointer<U>) {
     MarkWord::from_ptr(p, |mw| mw.mark());
+    let header = PageHeader::find(p.into());
+    (*header).flags.mark();
 }
 
 const MARK_WORD_INIT: MarkWord = MarkWord(0);
@@ -204,12 +206,33 @@ fn is_aligned(ptr: *const ()) -> bool {
     ptr as usize & (PAGE_ALIGN - 1) == 0
 }
 
+/// Flags that apply to the whole page.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct PageHeaderFlags(usize);
+
+impl PageHeaderFlags {
+    /// Were any objects within this page marked?
+    fn is_marked(&self) -> bool {
+        self.0 & MARK_BIT != 0
+    }
+
+    /// Mark this page as containing at least one marked object.
+    fn mark(&mut self) {
+        self.0 |= MARK_BIT;
+    }
+
+    fn unmark(&mut self) {
+        self.0 &= !MARK_BIT;
+    }
+}
+
 pub struct PageHeader {
     pub heap: *mut GcHeap,
     next_page: *mut PageHeader,
     mark_fn: unsafe fn(UntypedPointer, &mut MarkingTracer),
     freelist: *mut (),
     allocation_size: usize,
+    flags: PageHeaderFlags,
 }
 
 impl PageHeader {
@@ -254,7 +277,7 @@ impl PageHeader {
 
     /// Address of the first allocation on this page.
     fn begin(&self) -> usize {
-        (self as *const PageHeader as usize) + Self::begin_offset()
+       (self as *const PageHeader as usize) + Self::begin_offset()
     }
 
     fn end(&self) -> usize {
@@ -263,6 +286,7 @@ impl PageHeader {
     }
 
     pub fn clear_mark_bits(&mut self, roots: &mut Vec<UntypedPointer>) {
+        self.flags.unmark();
         let mut addr = self.begin();
         let end = self.end();
         while addr < end {
@@ -280,7 +304,7 @@ impl PageHeader {
     }
 
     /// True if nothing on this page is allocated.
-    pub fn is_empty(&self) -> bool {
+    pub fn has_none_allocated(&self) -> bool {
         let mut addr = self.begin();
         let end = self.end();
         while addr < end {
@@ -291,6 +315,19 @@ impl PageHeader {
             addr += self.allocation_size;
         }
         true
+    }
+
+    pub fn assert_none_marked(&self) {
+        assert!(!self.flags.is_marked());
+
+        let mut addr = self.begin();
+        let end = self.end();
+        while addr < end {
+            let mark_word = unsafe { &mut *(addr as *mut MarkWord) };
+            assert!(!mark_word.is_marked());
+            assert!(!mark_word.is_pinned());
+            addr += self.allocation_size;
+        }
     }
 }
 
@@ -501,6 +538,7 @@ impl<U> TypedPage<U> {
 
 /// Results of sweeping a page: the page's status and number of objects
 /// reclaimed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SweepResult {
     /// The page is (still) full. It is therefore trivially true that we didn't
     /// reclaim any objects.
@@ -539,9 +577,13 @@ pub struct PageSet {
     full_pages: *mut PageHeader,
 
     /// Head of the linked list of empty pages.
+    ///
+    /// These pages are lazily swept, so their allocation bits may still be set,
+    /// and they must be swept before their space is reclaimed for new
+    /// allocations.
     empty_pages: *mut PageHeader,
 
-    /// Head of the linkedlist of partially full pages.
+    /// Head of the linked list of partially full pages.
     partial_pages: *mut PageHeader,
 
     /// The maximum number of pages, or None for no limit.
@@ -631,16 +673,14 @@ impl PageSet {
         }
     }
 
-    fn each_page<F: FnMut(&PageHeader)>(&self, mut f: F) {
+    pub(crate) fn each_non_empty_page<F: FnMut(&PageHeader)>(&self, mut f: F) {
         each_page(self.full_pages, &mut f);
         each_page(self.partial_pages, &mut f);
-        each_page(self.empty_pages, &mut f);
     }
 
-    fn each_page_mut<F: FnMut(&mut PageHeader)>(&mut self, mut f: F) {
+    pub(crate) fn each_non_empty_page_mut<F: FnMut(&mut PageHeader)>(&mut self, mut f: F) {
         each_page_mut(self.full_pages, &mut f);
         each_page_mut(self.partial_pages, &mut f);
-        each_page_mut(self.empty_pages, &mut f);
     }
 
     /// Clear mark bits from each page in this set.
@@ -649,7 +689,14 @@ impl PageSet {
     ///
     /// This must be called only at the beginning of a GC cycle.
     pub unsafe fn clear_mark_bits(&mut self, roots: &mut Vec<UntypedPointer>) {
-        self.each_page_mut(|page| page.clear_mark_bits(roots));
+        self.each_non_empty_page_mut(|page| page.clear_mark_bits(roots));
+
+        // Don't need to clear the mark bits for empty pages, as none are set.
+        if cfg!(debug_assertions) {
+            each_page(self.empty_pages, |page| {
+                page.assert_none_marked();
+            });
+        }
     }
 
     /// Sweep all unmarked objects from all pages and return the number of
@@ -664,19 +711,26 @@ impl PageSet {
         let mut new_full_pages = ptr::null_mut();
         let mut new_partial_pages = ptr::null_mut();
         // Because we don't need to sweep empty pages, we won't modify their
-        // list while iterating over them, and don't need a new head element for
-        // them.
+        // list while also iterating over them, and don't need a new head
+        // element for them.
 
         for &page_header in &[self.full_pages, self.partial_pages] {
             let mut page = page_header;
             while !page.is_null() {
                 let next_page = (*page).next_page;
+
+                if !(*page).flags.is_marked() {
+                    // None of this page's objects were marked, meaning that
+                    // they are all garbage and this page is now empty. Delay
+                    // sweeping this page until either we allocate from it again
+                    // or drop it.
+                    (*page).next_page = self.empty_pages;
+                    self.empty_pages = page;
+                    page = next_page;
+                    continue;
+                }
+
                 match (self.sweep_fn)(&mut *page) {
-                    SweepResult::Empty(swept_this_page) => {
-                        num_swept += swept_this_page as usize;
-                        (*page).next_page = self.empty_pages;
-                        self.empty_pages = page;
-                    }
                     SweepResult::Partial(swept_this_page) => {
                         num_swept += swept_this_page as usize;
                         (*page).next_page = new_partial_pages;
@@ -686,7 +740,11 @@ impl PageSet {
                         (*page).next_page = new_full_pages;
                         new_full_pages = page;
                     }
+                    SweepResult::Empty(_) => {
+                        panic!("How can a page be empty after sweeping if it contained marked objects?");
+                    }
                 }
+
                 page = next_page;
             }
         }
@@ -697,11 +755,36 @@ impl PageSet {
         num_swept
     }
 
+    pub unsafe fn force_sweep(&mut self) -> usize {
+        let mut num_swept = self.sweep();
+
+        each_page_mut(self.empty_pages, |page| {
+            match (self.sweep_fn)(page) {
+                SweepResult::Empty(swept_this_page) => {
+                    num_swept += swept_this_page as usize;
+                }
+                otherwise => {
+                    panic!("Pages in the empty pages list should be empty: {:?}", otherwise);
+                }
+            }
+        });
+
+        num_swept
+    }
+
     /// True if nothing is allocated in this set of pages.
     pub fn all_pages_are_empty(&self) -> bool {
-        let mut empty = true;
-        self.each_page(|page| { empty &= page.is_empty(); });
-        empty
+        if cfg!(debug_assertions) {
+            self.each_non_empty_page(|page| assert!(!page.has_none_allocated()));
+
+            each_page(self.empty_pages, |page| {
+                // Note that `page.has_none_allocated()` does not hold because
+                // of incremental sweeping.
+                page.assert_none_marked();
+            });
+        }
+
+        self.full_pages.is_null() && self.partial_pages.is_null()
     }
 
     pub fn set_page_limit(&mut self, limit: Option<usize>) {
@@ -729,8 +812,6 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
     pub unsafe fn try_fast_alloc(&mut self) -> Option<UninitializedAllocation<T::In>> {
         if !self.partial_pages.is_null() {
             Some(self.infallible_fast_alloc_from_partial())
-        } else if !self.empty_pages.is_null() {
-            Some(self.infallible_fast_alloc_from_empty())
         } else {
             None
         }
@@ -756,12 +837,31 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
         ptr
     }
 
-    unsafe fn infallible_fast_alloc_from_empty(&mut self) -> UninitializedAllocation<T::In> {
+    /// Do an incremental sweep of the next empty page and then infallibly
+    /// allocate from it. Return the number of objects swept and the
+    /// uninitialized allocation.
+    unsafe fn infallible_incremental_sweep_and_alloc_from_empty(&mut self) -> (u16, UninitializedAllocation<T::In>) {
         // We have an empty page. Allocation can't fail.
         debug_assert!(!self.empty_pages.is_null());
 
         let front_page = self.empty_pages;
         let page = (*front_page).unchecked_downcast_mut::<T>();
+
+        // We never swept the page before, so we need to do it now, just before
+        // we allocate into it again.
+        let num_swept = match page.sweep() {
+            SweepResult::Empty(n) => {
+                n
+            }
+            otherwise => {
+                panic!(
+                    "incremental sweeping page that was never marked didn't \
+                     result in an empty page?? {:?}",
+                    otherwise
+                );
+            }
+        };
+
         let ptr = page.infallible_alloc();
 
         // This page is no longer empty. Determine if it belongs with the full
@@ -775,7 +875,7 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
             self.partial_pages = &mut page.header;
         }
 
-        ptr
+        (num_swept, ptr)
     }
 
     /// Allocate memory for a value of type `T::In`.
@@ -783,22 +883,22 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
     /// # Safety
     ///
     /// Safe to call as long as GC is not happening.
-    pub unsafe fn try_alloc(&mut self) -> Option<UninitializedAllocation<T::In>> {
+    pub unsafe fn try_alloc(&mut self) -> Option<(u16, UninitializedAllocation<T::In>)> {
         // First, try to allocate from an existing, partially full page.
         if !self.partial_pages.is_null() {
-            return Some(self.infallible_fast_alloc_from_partial());
+            return Some((0, self.infallible_fast_alloc_from_partial()));
         }
 
         // Second, try to allocate from an existing empty page. By preferring to
-        // allocate from partially full pages, we cut down on fragmentation.
+        // allocate from partially full pages, we cut down on fragmentation. This performs incremental
         if !self.empty_pages.is_null() {
-            return Some(self.infallible_fast_alloc_from_empty());
+            return Some(self.infallible_incremental_sweep_and_alloc_from_empty());
         }
 
         // If there is a limit and we already have at least that many pages, fail.
         match self.limit {
             Some(limit) if self.page_count >= limit => None,
-            _ => self.new_page().try_alloc(),
+            _ => self.new_page().try_alloc().map(|p| (0, p)),
         }
     }
 
@@ -855,7 +955,8 @@ impl<'a, 'h, T: IntoHeapAllocation<'h> + 'a> PageSetRef<'a, 'h, T> {
                         next_page: *list_head,
                         mark_fn: mark_entry_point::<T>,
                         freelist: ptr::null_mut(),
-                        allocation_size: TypedPage::<T::In>::allocation_size()
+                        allocation_size: TypedPage::<T::In>::allocation_size(),
+                        flags: PageHeaderFlags::default(),
                     },
                     allocations: PhantomData,
                 },
@@ -925,5 +1026,11 @@ impl<U> Drop for UninitializedAllocation<U> {
             let page = TypedPage::<U>::find(self.ptr);
             (*page).add_to_free_list(self.as_mut()); // XXX UB if page is aliased
         }
+    }
+}
+
+impl<T> fmt::Debug for UninitializedAllocation<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "UninitializedAllocation {{ {:p} }}", self.ptr.as_void())
     }
 }
